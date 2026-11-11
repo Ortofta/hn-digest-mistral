@@ -5,7 +5,9 @@ from mistralai.workflows.client import get_mistral_client
 from pydantic import BaseModel, Field
 
 HN_FRONT_PAGE_URL = "https://hn.algolia.com/api/v1/search"
+HN_SEARCH_BY_DATE_URL = "https://hn.algolia.com/api/v1/search_by_date"
 HN_ITEM_URL = "https://news.ycombinator.com/item?id={object_id}"
+STOCKHOLM_TZ = "Europe/Stockholm"
 ICLOUD_SMTP_HOST = "smtp.mail.me.com"
 ICLOUD_SMTP_PORT = 587
 DEFAULT_CHAT_MODEL = "mistral-large-latest"
@@ -23,6 +25,12 @@ class DigestInput(BaseModel):
     chat_model: str = Field(default=DEFAULT_CHAT_MODEL, description="Model used for filtering, summarizing and scripting.")
     tts_model: str = Field(default=DEFAULT_TTS_MODEL, description="TTS model used for the podcast audio.")
     dry_run: bool = Field(default=False, description="Build the digest and audio but do not send the email.")
+    monday_lookback_days: int = Field(
+        default=0,
+        ge=0,
+        le=7,
+        description="If > 0, runs on Mondays (Europe/Stockholm) fetch stories from the last N days instead of only the current front page, so weekend news is covered.",
+    )
 
 
 class HNItem(BaseModel):
@@ -115,16 +123,39 @@ def _message_text(content) -> str:
     return content
 
 
-@workflows.activity(start_to_close_timeout=timedelta(seconds=60), retry_policy_max_attempts=3)
-async def fetch_front_page(hits_per_page: int = 30) -> list[HNItem]:
-    import httpx
+def _effective_lookback_days(monday_lookback_days: int, now=None) -> int:
+    if monday_lookback_days <= 0:
+        return 0
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
 
+    if now is None:
+        now = datetime.now(ZoneInfo(STOCKHOLM_TZ))
+    return monday_lookback_days if now.weekday() == 0 else 0
+
+
+@workflows.activity(start_to_close_timeout=timedelta(seconds=60), retry_policy_max_attempts=3)
+async def fetch_stories(hits_per_page: int = 30, monday_lookback_days: int = 0) -> list[HNItem]:
+    import httpx
+    from datetime import datetime, timezone
+
+    lookback_days = _effective_lookback_days(monday_lookback_days)
     async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": "hn-digest-workflow/1.0"}) as http:
-        response = await http.get(HN_FRONT_PAGE_URL, params={"tags": "front_page", "hitsPerPage": hits_per_page})
+        if lookback_days > 0:
+            since = int(datetime.now(timezone.utc).timestamp()) - lookback_days * 86400
+            response = await http.get(
+                HN_SEARCH_BY_DATE_URL,
+                params={"tags": "story", "numericFilters": f"created_at_i>{since}", "hitsPerPage": 100},
+            )
+        else:
+            response = await http.get(HN_FRONT_PAGE_URL, params={"tags": "front_page", "hitsPerPage": hits_per_page})
         response.raise_for_status()
         data = response.json()
+    hits = data.get("hits", [])
+    if lookback_days > 0:
+        hits = sorted(hits, key=lambda h: (h.get("points") or 0, h.get("num_comments") or 0), reverse=True)[:hits_per_page]
     items: list[HNItem] = []
-    for hit in data.get("hits", []):
+    for hit in hits:
         object_id = str(hit.get("objectID", ""))
         items.append(
             HNItem(
@@ -270,7 +301,7 @@ async def deliver_digest(
 class HnTechDigestWorkflow:
     @workflows.workflow.entrypoint
     async def run(self, input: DigestInput) -> DigestOutput:
-        items = await fetch_front_page(30)
+        items = await fetch_stories(30, input.monday_lookback_days)
         plan = await build_digest(items, input.max_stories, input.chat_model)
         script = await write_podcast_script(plan, input.chat_model)
         delivery = await deliver_digest(

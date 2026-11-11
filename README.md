@@ -26,6 +26,11 @@ The workflow runs as a **one-shot** managed deployment on Mistral Cloud: no sche
 | `chat_model` | `mistral-large-latest` | Model for filtering/summarizing/scripting. |
 | `tts_model` | `voxtral-mini-tts-3-0` | TTS model for the audio. |
 | `dry_run` | `false` | Build digest + audio but skip sending the email. |
+| `monday_lookback_days` | `0` | If > 0, Monday runs (Europe/Stockholm) fetch stories from the last N days (ranked by points) instead of only the current front page, so weekend news is covered. |
+
+## Schedule
+
+Deployment `hn-digest` has one schedule: `45 6 * * 1-5` in `Europe/Stockholm` (Mon-Fri 06:45 Swedish time), input `{"monday_lookback_days": 3}`. Manual Start Workflow runs still work alongside it.
 
 ## Secrets
 
