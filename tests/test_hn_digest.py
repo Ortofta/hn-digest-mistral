@@ -57,6 +57,29 @@ PLAN = {
 
 SCRIPT = "Welcome to the Hacker News tech digest. First up: BigChip unveiled its next-gen AI accelerator..."
 
+WEEKEND_PAYLOAD = {
+    "hits": [
+        {
+            "objectID": "2002",
+            "title": "Weekend read: open-source database hits 1.0",
+            "url": "https://example.com/oss-db-1-0",
+            "points": 40,
+            "num_comments": 12,
+            "author": "ossdev",
+            "created_at": "2026-11-07T15:00:00.000Z",
+        },
+        {
+            "objectID": "2001",
+            "title": "EU parliament passes AI Act implementation rules",
+            "url": "https://www.reuters.com/technology/eu-ai-act-rules",
+            "points": 640,
+            "num_comments": 410,
+            "author": "reporter2",
+            "created_at": "2026-11-08T09:00:00.000Z",
+        },
+    ]
+}
+
 
 class FakeHTTPResponse:
     def __init__(self, payload):
@@ -70,6 +93,8 @@ class FakeHTTPResponse:
 
 
 class FakeAsyncClient:
+    calls = []
+
     def __init__(self, *args, **kwargs):
         pass
 
@@ -80,9 +105,16 @@ class FakeAsyncClient:
         return False
 
     async def get(self, url, params=None):
-        assert url == hn.HN_FRONT_PAGE_URL
-        assert params == {"tags": "front_page", "hitsPerPage": 30}
-        return FakeHTTPResponse(ALGOLIA_PAYLOAD)
+        FakeAsyncClient.calls.append((url, params))
+        if url == hn.HN_FRONT_PAGE_URL:
+            assert params == {"tags": "front_page", "hitsPerPage": 30}
+            return FakeHTTPResponse(ALGOLIA_PAYLOAD)
+        if url == hn.HN_SEARCH_BY_DATE_URL:
+            assert params["tags"] == "story"
+            assert params["hitsPerPage"] == 100
+            assert params["numericFilters"].startswith("created_at_i>")
+            return FakeHTTPResponse(WEEKEND_PAYLOAD)
+        raise AssertionError(f"unexpected url: {url}")
 
 
 class FakeChat:
@@ -150,13 +182,14 @@ def _install_fakes(monkeypatch):
     monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
     monkeypatch.setattr(smtplib, "SMTP", FakeSMTP)
     FakeSMTP.instances = []
+    FakeAsyncClient.calls = []
     monkeypatch.setenv("ICLOUD_EMAIL", "me@icloud.com")
     monkeypatch.setenv("ICLOUD_APP_PASSWORD", "xxxx-yyyy-zzzz-wwww")
     return fake_client
 
 
 async def _run_workflow(temporal_env, workflow_input):
-    activities = [hn.fetch_front_page, hn.build_digest, hn.write_podcast_script, hn.deliver_digest]
+    activities = [hn.fetch_stories, hn.build_digest, hn.write_podcast_script, hn.deliver_digest]
     async with create_test_worker(temporal_env, [hn.HnTechDigestWorkflow], activities=activities):
         handle = await temporal_env.client.start_workflow(
             "hn-tech-digest",
@@ -224,3 +257,31 @@ async def test_recipient_override(monkeypatch, temporal_env):
 
     assert result["delivery"]["recipient"] == "other@me.com"
     assert FakeSMTP.instances[0].sent[0]["To"] == "other@me.com"
+
+
+def test_effective_lookback_days():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    stockholm = ZoneInfo(hn.STOCKHOLM_TZ)
+    monday = datetime(2026, 11, 9, 12, 0, tzinfo=stockholm)
+    tuesday = datetime(2026, 11, 10, 12, 0, tzinfo=stockholm)
+    assert monday.weekday() == 0
+    assert hn._effective_lookback_days(3, now=monday) == 3
+    assert hn._effective_lookback_days(3, now=tuesday) == 0
+    assert hn._effective_lookback_days(0, now=monday) == 0
+
+
+async def test_monday_lookback_fetches_weekend_stories(monkeypatch, temporal_env):
+    fake_client = _install_fakes(monkeypatch)
+    monkeypatch.setattr(hn, "_effective_lookback_days", lambda days, now=None: days)
+
+    result = await _run_workflow(temporal_env, {"dry_run": True, "monday_lookback_days": 3})
+
+    urls = [url for url, _ in FakeAsyncClient.calls]
+    assert hn.HN_SEARCH_BY_DATE_URL in urls
+    assert hn.HN_FRONT_PAGE_URL not in urls
+    listing = fake_client.chat.calls[0]["messages"][1]["content"]
+    assert "EU parliament passes AI Act implementation rules" in listing
+    assert "Weekend read: open-source database hits 1.0" in listing
+    assert result["delivery"]["dry_run"] is True
