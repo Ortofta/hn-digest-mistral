@@ -205,8 +205,8 @@ async def build_digest(stories: list[HNItem], max_stories: int, chat_model: str)
     system_prompt = DIGEST_SYSTEM_PROMPT.format(max_stories=max_stories)
     fallback_model = "mistral-medium-latest" if chat_model != "mistral-medium-latest" else "mistral-large-latest"
     attempts = [
-        (chat_model, {"type": "json_schema", "json_schema": {"name": "digest_plan", "schema": DIGEST_JSON_SCHEMA, "strict": True}}),
         (chat_model, {"type": "json_object"}),
+        (chat_model, {"type": "json_schema", "json_schema": {"name": "digest_plan", "schema": DIGEST_JSON_SCHEMA, "strict": True}}),
         (fallback_model, {"type": "json_object"}),
     ]
     plan = None
@@ -231,7 +231,7 @@ async def build_digest(stories: list[HNItem], max_stories: int, chat_model: str)
             plan = DigestPlan.model_validate_json(_extract_json(text))
             break
         except Exception as exc:
-            finish_reason = getattr(choice.message, "finish_reason", None) if choice else None
+            finish_reason = getattr(choice, "finish_reason", None) if choice else None
             last_error = RuntimeError(
                 f"build_digest attempt {attempt + 1} (model={model}) failed: finish_reason={finish_reason!r}, "
                 f"content[:200]={text[:200]!r}: {exc}"
@@ -251,24 +251,40 @@ async def write_podcast_script(plan: DigestPlan, chat_model: str) -> str:
     client = get_mistral_client()
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     user_prompt = f"Today is {today}. Write the podcast script for this digest:\n\nSubject: {plan.subject}\n\n{plan.digest_markdown}"
-    script = ""
+    import json
+
+    fallback_model = "mistral-medium-latest" if chat_model != "mistral-medium-latest" else "mistral-large-latest"
+    script_system = SCRIPT_SYSTEM_PROMPT + '\nRespond with a single JSON object {"script": "<the monologue text>"} and nothing else.'
     last_error = None
-    for attempt in range(2):
+    for attempt, model in enumerate([chat_model, fallback_model]):
         response = await client.chat.complete_async(
-            model=chat_model,
+            model=model,
             messages=[
-                {"role": "system", "content": SCRIPT_SYSTEM_PROMPT},
+                {"role": "system", "content": script_system},
                 {"role": "user", "content": user_prompt},
             ],
+            response_format={"type": "json_object"},
             temperature=0.7,
-            max_tokens=1024,
+            max_tokens=2048,
         )
         choice = response.choices[0] if response.choices else None
-        script = _message_text(choice.message.content).strip() if choice else ""
+        text = _message_text(choice.message.content) if choice else ""
+        script = ""
+        try:
+            payload = json.loads(_extract_json(text))
+            if isinstance(payload, dict):
+                script = (payload.get("script") or "").strip()
+        except Exception as exc:
+            last_error = RuntimeError(
+                f"write_podcast_script attempt {attempt + 1} (model={model}) invalid JSON: content[:200]={text[:200]!r}: {exc}"
+            )
+            continue
         if script:
             return script
-        finish_reason = getattr(choice.message, "finish_reason", None) if choice else None
-        last_error = RuntimeError(f"write_podcast_script attempt {attempt + 1} returned empty content (finish_reason={finish_reason!r})")
+        finish_reason = getattr(choice, "finish_reason", None) if choice else None
+        last_error = RuntimeError(
+            f"write_podcast_script attempt {attempt + 1} (model={model}) returned empty script (finish_reason={finish_reason!r})"
+        )
     raise last_error
 
 

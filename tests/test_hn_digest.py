@@ -127,11 +127,12 @@ class FakeChat:
         if self.scripted:
             content = self.scripted.pop(0)
         elif kwargs.get("response_format"):
-            content = json.dumps(PLAN)
+            system = kwargs["messages"][0]["content"]
+            content = json.dumps({"script": SCRIPT}) if "podcast" in system else json.dumps(PLAN)
         else:
             content = SCRIPT
-        message = SimpleNamespace(content=content, finish_reason="stop")
-        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+        message = SimpleNamespace(content=content)
+        return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="stop")])
 
 
 class FakeSpeech:
@@ -299,13 +300,14 @@ def test_extract_json():
 
 
 async def test_build_digest_recovers_from_empty_content(monkeypatch, temporal_env):
-    fake_client = _install_fakes(monkeypatch, scripted=["", json.dumps(PLAN), SCRIPT])
+    fake_client = _install_fakes(monkeypatch, scripted=["", json.dumps(PLAN), json.dumps({"script": SCRIPT})])
 
     result = await _run_workflow(temporal_env, {"dry_run": True})
 
     assert result["subject"] == PLAN["subject"]
-    digest_calls = [c for c in fake_client.chat.calls if c.get("response_format")]
+    assert result["podcast_script"] == SCRIPT
+    digest_calls = [c for c in fake_client.chat.calls if "podcast" not in c["messages"][0]["content"]]
     assert len(digest_calls) == 2
-    assert digest_calls[0]["response_format"]["type"] == "json_schema"
-    assert digest_calls[1]["response_format"]["type"] == "json_object"
+    assert digest_calls[0]["response_format"]["type"] == "json_object"
+    assert digest_calls[1]["response_format"]["type"] == "json_schema"
     assert digest_calls[1]["max_tokens"] == 4096
