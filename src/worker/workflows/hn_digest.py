@@ -118,9 +118,24 @@ Plain text only: no markdown, no bullet markers, no stage directions, no phoneti
 
 
 def _message_text(content) -> str:
+    if content is None:
+        return ""
     if isinstance(content, list):
         return "".join(part.get("text", "") for part in content if isinstance(part, dict))
     return content
+
+
+def _extract_json(text: str) -> str:
+    import re
+
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z0-9]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text).strip()
+    if text.startswith("{"):
+        return text
+    match = re.search(r"\{.*\}", text, re.S)
+    return match.group(0) if match else text
 
 
 def _effective_lookback_days(monday_lookback_days: int, now=None) -> int:
@@ -171,8 +186,9 @@ async def fetch_stories(hits_per_page: int = 30, monday_lookback_days: int = 0) 
     return items
 
 
-@workflows.activity(start_to_close_timeout=timedelta(minutes=3), retry_policy_max_attempts=3)
+@workflows.activity(start_to_close_timeout=timedelta(minutes=5), retry_policy_max_attempts=3)
 async def build_digest(stories: list[HNItem], max_stories: int, chat_model: str) -> DigestPlan:
+    import json
     from datetime import datetime, timezone
     from urllib.parse import urlparse
 
@@ -186,19 +202,42 @@ async def build_digest(stories: list[HNItem], max_stories: int, chat_model: str)
         f"Today is {today}. Here are the current Hacker News front-page items (index, title, score, comments, author, host):\n\n"
         f"{listing}\n\nSelect the tech-industry stories and return the digest as JSON."
     )
-    response = await client.chat.complete_async(
-        model=chat_model,
-        messages=[
-            {"role": "system", "content": DIGEST_SYSTEM_PROMPT.format(max_stories=max_stories)},
-            {"role": "user", "content": user_prompt},
-        ],
-        response_format={
-            "type": "json_schema",
-            "json_schema": {"name": "digest_plan", "schema": DIGEST_JSON_SCHEMA, "strict": True},
-        },
-        temperature=0.3,
-    )
-    plan = DigestPlan.model_validate_json(_message_text(response.choices[0].message.content))
+    system_prompt = DIGEST_SYSTEM_PROMPT.format(max_stories=max_stories)
+    fallback_model = "mistral-medium-latest" if chat_model != "mistral-medium-latest" else "mistral-large-latest"
+    attempts = [
+        (chat_model, {"type": "json_schema", "json_schema": {"name": "digest_plan", "schema": DIGEST_JSON_SCHEMA, "strict": True}}),
+        (chat_model, {"type": "json_object"}),
+        (fallback_model, {"type": "json_object"}),
+    ]
+    plan = None
+    last_error = None
+    for attempt, (model, response_format) in enumerate(attempts):
+        system = system_prompt
+        if response_format["type"] == "json_object":
+            system += "\nRespond with a single JSON object matching this schema and nothing else:\n" + json.dumps(DIGEST_JSON_SCHEMA)
+        response = await client.chat.complete_async(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format=response_format,
+            temperature=0.2,
+            max_tokens=4096,
+        )
+        choice = response.choices[0] if response.choices else None
+        text = _message_text(choice.message.content) if choice else ""
+        try:
+            plan = DigestPlan.model_validate_json(_extract_json(text))
+            break
+        except Exception as exc:
+            finish_reason = getattr(choice.message, "finish_reason", None) if choice else None
+            last_error = RuntimeError(
+                f"build_digest attempt {attempt + 1} (model={model}) failed: finish_reason={finish_reason!r}, "
+                f"content[:200]={text[:200]!r}: {exc}"
+            )
+    if plan is None:
+        raise last_error
     plan.stories = plan.stories[:max_stories]
     if not plan.subject:
         plan.subject = f"HN Tech Digest - {today}"
@@ -212,16 +251,25 @@ async def write_podcast_script(plan: DigestPlan, chat_model: str) -> str:
     client = get_mistral_client()
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     user_prompt = f"Today is {today}. Write the podcast script for this digest:\n\nSubject: {plan.subject}\n\n{plan.digest_markdown}"
-    response = await client.chat.complete_async(
-        model=chat_model,
-        messages=[
-            {"role": "system", "content": SCRIPT_SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.7,
-        max_tokens=1024,
-    )
-    return _message_text(response.choices[0].message.content).strip()
+    script = ""
+    last_error = None
+    for attempt in range(2):
+        response = await client.chat.complete_async(
+            model=chat_model,
+            messages=[
+                {"role": "system", "content": SCRIPT_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.7,
+            max_tokens=1024,
+        )
+        choice = response.choices[0] if response.choices else None
+        script = _message_text(choice.message.content).strip() if choice else ""
+        if script:
+            return script
+        finish_reason = getattr(choice.message, "finish_reason", None) if choice else None
+        last_error = RuntimeError(f"write_podcast_script attempt {attempt + 1} returned empty content (finish_reason={finish_reason!r})")
+    raise last_error
 
 
 def _require_env(name: str) -> str:
