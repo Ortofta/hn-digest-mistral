@@ -32,6 +32,18 @@ The workflow runs as a **one-shot** managed deployment on Mistral Cloud: no sche
 
 Deployment `hn-digest` has one schedule: `45 6 * * 1-5` in `Europe/Stockholm` (Mon-Fri 06:45 Swedish time), input `{"monday_lookback_days": 3}`. Manual Start Workflow runs still work alongside it.
 
+## Ars Technica digest (`ars-tech-digest`)
+
+Second workflow in the same worker: summarizes the latest articles from your **Ars Technica subscriber RSS feed**,
+renders a podcast MP3, and emails it to the same iCloud inbox. Same schedule (Mon-Fri 06:45 Europe/Stockholm).
+
+The feed URL contains your subscriber token, so it is **never stored in this repo or in workflow inputs**. The worker
+reads it from the `ARS_RSS_URL` environment variable; bind the workspace secret `ars_rss_url` to `ARS_RSS_URL` on the
+deployment (Studio -> deployment -> Settings -> Secrets), then restart the deployment.
+
+Input fields: `recipient`, `voice_id`, `max_articles` (default 8), `feed_items` (default 20), `chat_model`,
+`tts_model`, `dry_run` — all optional.
+
 ## Secrets
 
 The deployment binds two workspace secrets (created in Mistral Studio -> Secrets) as environment variables:
