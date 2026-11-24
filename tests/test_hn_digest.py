@@ -118,17 +118,21 @@ class FakeAsyncClient:
 
 
 class FakeChat:
-    def __init__(self):
+    def __init__(self, scripted=None):
         self.calls = []
+        self.scripted = list(scripted) if scripted else None
 
     async def complete_async(self, **kwargs):
         self.calls.append(kwargs)
-        if kwargs.get("response_format"):
-            content = json.dumps(PLAN)
+        if self.scripted:
+            content = self.scripted.pop(0)
+        elif kwargs.get("response_format"):
+            system = kwargs["messages"][0]["content"]
+            content = json.dumps({"script": SCRIPT}) if "podcast" in system else json.dumps(PLAN)
         else:
             content = SCRIPT
         message = SimpleNamespace(content=content)
-        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+        return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="stop")])
 
 
 class FakeSpeech:
@@ -141,8 +145,8 @@ class FakeSpeech:
 
 
 class FakeMistralClient:
-    def __init__(self):
-        self.chat = FakeChat()
+    def __init__(self, scripted=None):
+        self.chat = FakeChat(scripted)
         self.audio = SimpleNamespace(speech=FakeSpeech())
 
 
@@ -176,8 +180,8 @@ class FakeSMTP:
         self.sent.append(message)
 
 
-def _install_fakes(monkeypatch):
-    fake_client = FakeMistralClient()
+def _install_fakes(monkeypatch, scripted=None):
+    fake_client = FakeMistralClient(scripted)
     monkeypatch.setattr(hn, "get_mistral_client", lambda: fake_client)
     monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
     monkeypatch.setattr(smtplib, "SMTP", FakeSMTP)
@@ -285,3 +289,25 @@ async def test_monday_lookback_fetches_weekend_stories(monkeypatch, temporal_env
     assert "EU parliament passes AI Act implementation rules" in listing
     assert "Weekend read: open-source database hits 1.0" in listing
     assert result["delivery"]["dry_run"] is True
+
+
+def test_extract_json():
+    assert json.loads(hn._extract_json(json.dumps(PLAN)))["subject"] == PLAN["subject"]
+    fenced = "```json\n" + json.dumps(PLAN) + "\n```"
+    assert json.loads(hn._extract_json(fenced))["subject"] == PLAN["subject"]
+    wrapped = "Here is the digest:\n" + json.dumps(PLAN) + "\nHope that helps!"
+    assert json.loads(hn._extract_json(wrapped))["subject"] == PLAN["subject"]
+
+
+async def test_build_digest_recovers_from_empty_content(monkeypatch, temporal_env):
+    fake_client = _install_fakes(monkeypatch, scripted=["", json.dumps(PLAN), json.dumps({"script": SCRIPT})])
+
+    result = await _run_workflow(temporal_env, {"dry_run": True})
+
+    assert result["subject"] == PLAN["subject"]
+    assert result["podcast_script"] == SCRIPT
+    digest_calls = [c for c in fake_client.chat.calls if "podcast" not in c["messages"][0]["content"]]
+    assert len(digest_calls) == 2
+    assert digest_calls[0]["response_format"]["type"] == "json_object"
+    assert digest_calls[1]["response_format"]["type"] == "json_schema"
+    assert digest_calls[1]["max_tokens"] == 4096
